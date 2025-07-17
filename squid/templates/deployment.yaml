@@ -26,6 +26,32 @@ spec:
       serviceAccountName: {{ include "squid.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      
+      # --- INIT CONTAINER ---
+      # This container runs as root to prepare certificates, initialize the SSL DB,
+      # and set the correct file permissions before the main Squid container starts.
+      initContainers:
+      - name: squid-init
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        securityContext:
+          # Must run as root to perform chown
+          runAsUser: 0
+        command: ["/bin/sh", "-c", "/scripts/squid-init.sh"]
+ 
+        volumeMounts:
+        - name: squid-certs-secret
+          mountPath: /mnt/squid-secret
+          readOnly: true
+        - name: squid-certs-vol
+          mountPath: /etc/squid/certs
+        - name: squid-spool-vol
+          mountPath: /var/spool/squid
+        - name: squid-init-script
+          mountPath: /scripts/squid-init.sh
+          subPath: squid-init.sh
+          readOnly: true        
+
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -48,6 +74,13 @@ spec:
             - name: squid-config
               mountPath: /etc/squid/squid.conf
               subPath: squid.conf
+            # Mount the shared volume for the certificates
+            - name: squid-certs-vol
+              mountPath: /etc/squid/certs
+              readOnly: true
+            # Mount the entire spool directory for the main container
+            - name: squid-spool-vol
+              mountPath: /var/spool/squid              
         {{- if .Values.squidExporter.enabled }}
         - name: squid-exporter
           image: "{{ .Values.squidExporter.image.repository }}:{{ .Values.squidExporter.image.tag }}"
@@ -115,6 +148,22 @@ spec:
         - name: squid-config
           configMap:
             name: {{ include "squid.fullname" . }}-config
+        # Mount the secret created by cert-manager
+        - name: squid-certs-secret
+          secret:
+            secretName: {{ .Values.namespace.name }}-tls
+        # Shared emptyDir for the prepared certificates
+        - name: squid-certs-vol
+          emptyDir: {}
+        # A single volume for all of Squid's spool data, including the ssl_db
+        - name: squid-spool-vol
+          persistentVolumeClaim:
+            claimName: {{ include "squid.fullname" . }}-ssl-db
+        - name: squid-init-script
+          configMap:
+            name: {{ include "squid.fullname" . }}-init-configmap
+            defaultMode: 0755
+
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
