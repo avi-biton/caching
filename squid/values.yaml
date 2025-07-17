@@ -308,3 +308,10 @@ trust-manager:
 # Creates a self-signed issuer and bundle in the cert-manager namespace
 selfsigned-bundle:
   enabled: true  # Set to true to create a self-signed issuer and bundle
+
+# SSL Database configuration
+# Persistent storage for SSL certificates
+sslDb:
+  storage:
+    size: 1Gi  # Size of the PVC for SSL database
+    storageClass: ""  # Storage class to use (empty for default)

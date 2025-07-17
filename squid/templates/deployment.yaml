@@ -26,6 +26,70 @@ spec:
       serviceAccountName: {{ include "squid.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      
+      # --- INIT CONTAINER ---
+      # This container runs as root to prepare certificates, initialize the SSL DB,
+      # and set the correct file permissions before the main Squid container starts.
+      initContainers:
+      - name: squid-init
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        securityContext:
+          # Must run as root to perform chown
+          runAsUser: 0
+        command:
+        - /bin/sh
+        - -c
+        - |
+          set -ex
+
+          CERT_DIR="/etc/squid/certs"
+          SPOOL_DIR="/var/spool/squid"
+          SSL_DB_DIR="$SPOOL_DIR/ssl_db"
+          SQUID_HELPER_PATH="/usr/lib64/squid/security_file_certgen"
+
+          echo "Preparing directories..."
+          mkdir -p "$CERT_DIR" "$SPOOL_DIR"
+          
+          # Ensure proper permissions for the spool directory
+          chown -R root:root "$SPOOL_DIR"
+          chmod -R 755 "$SPOOL_DIR"
+          
+          # Only clean SSL DB if it doesn't exist or if incomplete
+          if [ ! -d "$SSL_DB_DIR" ] || [ ! -f "$SSL_DB_DIR/index.txt" ]; then
+            echo "SSL DB not found or incomplete, initializing..."
+            rm -rf "$SSL_DB_DIR"
+            echo "Initializing SSL DB at $SSL_DB_DIR..."
+            # Let the helper utility create the database directory itself
+            "$SQUID_HELPER_PATH" -c -s "$SSL_DB_DIR" -M 4MB
+          else
+            echo "SSL DB already initialized, skipping initialization and preserving existing certificates..."
+          fi
+          echo "SSL DB initialized."
+
+          echo "Copying certificates..."
+          cp /mnt/squid-secret/tls.crt "$CERT_DIR/tls.crt"
+          cp /mnt/squid-secret/tls.key "$CERT_DIR/tls.key"
+
+          echo "Setting final permissions..."
+          # Set ownership for all required directories and files
+          chown -R {{ .Values.securityContext.runAsUser }}:{{ .Values.securityContext.runAsGroup }} "$CERT_DIR" "$SPOOL_DIR"
+          # Set restrictive permissions
+          chmod -R 700 "$CERT_DIR" "$SPOOL_DIR"
+          # Set more restrictive permissions for certificate files
+          chmod 644 "$CERT_DIR/tls.crt"
+          chmod 600 "$CERT_DIR/tls.key"
+          
+          echo "Initialization and permissions complete."
+        volumeMounts:
+        - name: squid-certs-secret
+          mountPath: /mnt/squid-secret
+          readOnly: true
+        - name: squid-certs-vol
+          mountPath: /etc/squid/certs
+        - name: squid-spool-vol
+          mountPath: /var/spool/squid
+
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -48,6 +112,13 @@ spec:
             - name: squid-config
               mountPath: /etc/squid/squid.conf
               subPath: squid.conf
+            # Mount the shared volume for the certificates
+            - name: squid-certs-vol
+              mountPath: /etc/squid/certs
+              readOnly: true
+            # Mount the entire spool directory for the main container
+            - name: squid-spool-vol
+              mountPath: /var/spool/squid              
         {{- if .Values.squidExporter.enabled }}
         - name: squid-exporter
           image: "{{ .Values.squidExporter.image.repository }}:{{ .Values.squidExporter.image.tag }}"
@@ -115,6 +186,18 @@ spec:
         - name: squid-config
           configMap:
             name: {{ include "squid.fullname" . }}-config
+        # Mount the secret created by cert-manager
+        - name: squid-certs-secret
+          secret:
+            secretName: {{ .Values.namespace.name }}-tls
+        # Shared emptyDir for the prepared certificates
+        - name: squid-certs-vol
+          emptyDir: {}
+        # A single volume for all of Squid's spool data, including the ssl_db
+        - name: squid-spool-vol
+          persistentVolumeClaim:
+            claimName: {{ include "squid.fullname" . }}-ssl-db
+
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
